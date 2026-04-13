@@ -20,23 +20,26 @@ library
                      , Language.Haskell.Tools.Parser.SplitTypesInModule
                      , Language.Haskell.Tools.Parser.RemoveUnusedFuns
                      , Language.Haskell.Tools.Parser.FlowChange
+                     , Language.Haskell.Tools.Parser.Ghc984Migration
+                     , Language.Haskell.Tools.Parser.CabalRunner
+                     , Language.Haskell.Tools.Parser.DirectoryRunner
 
   other-modules:       Language.Haskell.Tools.Parser.GetFunctionBranching
 
-  build-depends:       base                       
-                     , aeson                     
+  build-depends:       base
+                     , aeson
                      , mtl                       >= 2.2  && < 2.3
                      , uniplate                  >= 1.6  && < 1.7
                      , ghc-paths                 >= 0.1  && < 0.2
                      , containers                >= 0.5  && < 0.7
                      , directory                 >= 1.2  && < 1.4
                      , transformers              >= 0.5  && < 0.6
-                     , references                 
+                     , references
                      , split                     >= 0.2  && < 0.3
                      , filepath                  >= 1.4  && < 1.5
-                     , template-haskell           
-                     , ghc                        
-                     , Cabal                      
+                     , template-haskell
+                     , ghc
+                     , Cabal
                      , haskell-tools-ast         >= 1.1  && < 1.2
                      , haskell-tools-backend-ghc
                      , haskell-tools-rewrite     >= 1.1  && < 1.2
@@ -57,13 +60,21 @@ library
 
 executable ht-parse
   ghc-options:         -rtsopts
-  build-depends:       base                       
+  build-depends:       base
                      , split                     >= 0.2 && < 0.3
                      , mtl                       >= 2.2 && < 2.3
                      , directory                 >= 1.2  && < 1.4
-                     , filepath                  >= 1.4  && < 2.0 
-                     , optparse-applicative      
+                     , filepath                  >= 1.4  && < 2.0
+                     , optparse-applicative
                      , haskell-tools-parser
   hs-source-dirs:      exe
   main-is:             Main.hs
+  default-language:    Haskell2010
+
+executable ht-migrate
+  ghc-options:         -rtsopts
+  build-depends:       base
+                     , haskell-tools-parser
+  hs-source-dirs:      exe
+  main-is:             MigrateMain.hs
   default-language:    Haskell2010
