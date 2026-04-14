@@ -16,7 +16,7 @@ import Control.Monad
 import Control.Monad.IO.Class
 import qualified Data.HashMap.Strict as HM
 import Data.List
-import Data.Char (toLower)
+import Data.Char (toLower, isSpace)
 import Data.List.Extra (splitOn,trim,replace, cons)
 import GHC.LanguageExtensions
 import Control.Exception
@@ -146,7 +146,8 @@ moduleParser modulePath moduleName = do
     -- Apply text transformations BEFORE parsing:
     -- 1. Strip RecordDotPreprocessor pragmas
     -- 2. Change cryptonite -> crypton in package imports
-    let !processedLines = map fixPackageName $ filter (not . isProblematicPragma) (lines content)
+    -- 3. Strip package qualifiers (e.g., "cryptonite", "crypton") from imports to allow parsing without the package
+    let !processedLines = map stripPackageQualifier $ map fixPackageName $ filter (not . isProblematicPragma) (lines content)
     let !filteredContent = unlines processedLines
     -- Only process if changes were made
     if content == filteredContent
@@ -154,21 +155,41 @@ moduleParser modulePath moduleName = do
       else do
         -- Create a temp directory with modified file
         tmpDir <- getTemporaryDirectory
-        let tempBase = tmpDir FP.</> "ht-migrate" FP.</> map (\c -> if c == '/' then '_' else c) moduleName
-        createDirectoryIfMissing True tempBase
-        let tempPath = tempBase FP.</> takeFileName filePath
+        let tempBase = tmpDir FP.</> "ht-migrate" FP.</> map (\c -> if c == '.' then '_' else c) moduleName
+        -- Preserve the directory structure for module imports
+        -- Module Euler.Validation.Shims needs file at Euler/Validation/Shims.hs
+        let modParts = splitOn "." moduleName
+        let modDir = if length modParts > 1 then joinPath (init modParts) else "."
+        let tempDir = tempBase FP.</> modDir
+        createDirectoryIfMissing True tempDir
+        let tempPath = tempDir FP.</> takeFileName filePath
         writeFile tempPath filteredContent
         -- Parse from temp location with proper module path setup
         let tempModulePath = tempBase ++ "/"
         result <- parseModuleUnsafe tempModulePath moduleName
         -- Cleanup
         removeFile tempPath
-        removeDirectory tempBase
+        removeDirectoryRecursive tempBase
         return result
 
 -- | Fix package names in import statements (text-level replacement)
 fixPackageName :: String -> String
 fixPackageName line = replaceAll "\"cryptonite\"" "\"crypton\"" line
+
+-- | Strip package qualifiers from imports to allow parsing without the package being installed
+-- Converts: import "cryptonite" Crypto.Cipher.AES -> import Crypto.Cipher.AES
+stripPackageQualifier :: String -> String
+stripPackageQualifier line
+    | "import" `isPrefixOf` trimLine = stripPkg line
+    | otherwise = line
+  where
+    trimLine = dropWhile isSpace line
+    stripPkg str = case break (== '"') str of
+        (before, '"':after) ->
+            case break (== '"') after of
+                (_pkgName, '"':rest) -> stripPkg (before ++ rest)
+                _ -> str
+        _ -> str
 
 -- | Replace all occurrences of old with new in a string
 replaceAll :: String -> String -> String -> String
