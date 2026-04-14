@@ -53,10 +53,56 @@ migrateModule modulePath moduleName = do
     -- Create parent directories if they don't exist
     let dir = takeDirectory outputPath
     createDirectoryIfMissing True dir
-    writeFile outputPath (prettyPrint transformed)
+    let output = prettyPrint transformed
+    -- Post-process: fix base64 package imports and base16 expressions
+    let fixedOutput1 = fixBase64Imports output
+    let fixedOutput2 = fixBase16Expressions fixedOutput1
+    writeFile outputPath fixedOutput2
     putStrLn $ "Written: " ++ outputPath
     -- Post-processing for specific modules
     appendExceptFunction modulePath moduleName
+
+-- | Fix base64 package imports - add quotes around package name for PackageImports
+-- The AST pretty printer strips quotes, so we add them back post-processing
+fixBase64Imports :: String -> String
+fixBase64Imports = unlines . map fixLine . lines
+  where
+    fixLine line
+      -- Match import statements with unquoted base64-bytestring package
+      | "import " `isPrefixOf` line
+      , "base64-bytestring" `isInfixOf` line
+      , not ("\"base64-bytestring\"" `isInfixOf` line) =
+          -- Add quotes around base64-bytestring package name
+          let parts = words line
+          in unwords (map fixWord parts)
+      | otherwise = line
+
+    fixWord w
+      | w == "base64-bytestring" = "\"base64-bytestring\""
+      | otherwise = w
+
+-- | Fix base16-1.0 API changes in expressions
+-- encodeBase16 now returns Base16 Text, need to extract
+-- decodeBase16 now takes Base16 ByteString, need to wrap input
+fixBase16Expressions :: String -> String
+fixBase16Expressions input =
+    -- Fix encodeBase16 expressions: BS16.encodeBase16 <$> x -> BS16.extractBase16 <$> BS16.encodeBase16 <$> x
+    let step1 = replaceAll "BS16.encodeBase16\n          <*>" "BS16.extractBase16 <$> BS16.encodeBase16\n          <*>" input
+        step2 = replaceAll "BS16.encodeBase16\n          <$>" "BS16.extractBase16 <$> BS16.encodeBase16\n          <$>" step1
+        -- Fix decodeBase16: BS16.decodeBase16 (encodeUtf8 hash) -> BS16.decodeBase16 (BS16.Base16 (encodeUtf8 hash))
+        step3 = replaceAll "BS16.decodeBase16 (encodeUtf8" "BS16.decodeBase16 (BS16.Base16 (encodeUtf8" step2
+    in step3
+  where
+    replaceAll old new str =
+        case breakOn old str of
+          (before, "") -> before
+          (before, afterRest) ->
+              let after' = drop (length old) afterRest
+              in before ++ new ++ replaceAll old new after'
+    breakOn pat str =
+        case findIndex (isPrefixOf pat) (tails str) of
+          Nothing -> (str, "")
+          Just idx -> (take idx str, drop idx str)
 
 migrateModules :: [(String, String)] -> IO ()
 migrateModules = mapM_ (uncurry migrateModule)
@@ -92,7 +138,9 @@ transformModule modAst = do
     ast2 <- transformMtlModule ast1
     -- Step 3: Add missing imports for specific modules
     ast3 <- addMissingImports ast2
-    return ast3
+    -- Step 4: Transform base16-1.0 API usages
+    ast4 <- transformBase16Module ast3
+    return ast4
 
 -- | Add missing imports that can't be handled by biplateRef
 addMissingImports :: Ann UModule (Dom GhcPs) SrcTemplateStage -> IO (Ann UModule (Dom GhcPs) SrcTemplateStage)
@@ -117,6 +165,64 @@ addMissingImports modAst@(Ann ann (UModule filePragmas head imports decls)) =
     getImportsList (AnnListG _ imps) = imps
     isControlMonadImport (Ann _ (UImportDecl _ _ _ _ (Ann _ (UModuleName n)) _ _)) =
         n == "Control.Monad" || n == "qualified Control.Monad"
+
+-- =============================================================================
+-- TRANSFORMATION 4: base16-1.0 API Changes
+-- =============================================================================
+
+-- | Transform module for base16-1.0 compatibility
+-- In base16-1.0, encodeBase16 returns Base16 Text instead of Text
+-- We need to wrap encodeBase16 calls with unBase16
+transformBase16Module :: Ann UModule (Dom GhcPs) SrcTemplateStage -> IO (Ann UModule (Dom GhcPs) SrcTemplateStage)
+transformBase16Module modAst@(Ann ann (UModule filePragmas head imports decls)) = do
+    -- Check if this module imports Data.ByteString.Base16
+    let hasBase16Import = any isBase16Import (getImportsList imports)
+    if not hasBase16Import
+      then return modAst
+      else do
+        -- Step 1: Transform imports (remove extractBase16 if present, add unBase16)
+        let imports1 = transformBase16Imports imports
+        -- Step 2: Wrap encodeBase16 calls with unBase16
+        decls2 <- (!~) (biplateRef @_ @(Ann UExpr (Dom GhcPs) SrcTemplateStage)) (return . wrapEncodeBase16) decls
+        return $ Ann ann (UModule filePragmas head imports1 decls2)
+  where
+    getImportsList (AnnListG _ imps) = imps
+    isBase16Import (Ann _ (UImportDecl _ _ _ _ (Ann _ (UModuleName n)) _ _)) =
+        n == "Data.ByteString.Base16" || n == "qualified Data.ByteString.Base16"
+
+-- | Transform base16 imports: remove extractBase16
+-- Note: In base16-1.0, encodeBase16 returns Base16 Text which requires
+-- manual pattern matching to extract. No automatic import fix available.
+transformBase16Imports :: AnnListG UImportDecl (Dom GhcPs) SrcTemplateStage -> AnnListG UImportDecl (Dom GhcPs) SrcTemplateStage
+transformBase16Imports (AnnListG ann imps) =
+    AnnListG ann (map removeExtractBase16FromImport imps)
+
+-- | Remove extractBase16 from Data.ByteString.Base16 imports
+removeExtractBase16FromImport :: Ann UImportDecl (Dom GhcPs) SrcTemplateStage -> Ann UImportDecl (Dom GhcPs) SrcTemplateStage
+removeExtractBase16FromImport imp@(Ann ann (UImportDecl src qual safe pkg name rename spec)) =
+    case name of
+      Ann _ (UModuleName mn) | mn == "Data.ByteString.Base16" ->
+          let newSpec = removeExtractBase16FromSpec spec
+          in Ann ann (UImportDecl src qual safe pkg name rename newSpec)
+      _ -> imp
+
+removeExtractBase16FromSpec :: AnnMaybeG UImportSpec (Dom GhcPs) SrcTemplateStage -> AnnMaybeG UImportSpec (Dom GhcPs) SrcTemplateStage
+removeExtractBase16FromSpec spec@(AnnMaybeG ann Nothing) = spec
+removeExtractBase16FromSpec (AnnMaybeG ann (Just (Ann b (UImportSpecList (AnnListG c specs))))) =
+    let filtered = filter (not . isExtractBase16Spec) specs
+    in if null filtered
+        then AnnMaybeG ann Nothing
+        else AnnMaybeG ann (Just (Ann b (UImportSpecList (AnnListG c filtered))))
+removeExtractBase16FromSpec spec = spec
+
+isExtractBase16Spec :: Ann UIESpec (Dom GhcPs) SrcTemplateStage -> Bool
+isExtractBase16Spec (Ann _ (UIESpec _ name _)) = getNameString name == "extractBase16"
+isExtractBase16Spec _ = False
+
+-- | Placeholder for expression transformation - base16-1.0 requires manual fix
+-- The full transformation would wrap encodeBase16 calls with unBase16
+wrapEncodeBase16 :: Ann UExpr (Dom GhcPs) SrcTemplateStage -> Ann UExpr (Dom GhcPs) SrcTemplateStage
+wrapEncodeBase16 expr = expr  -- Identity transformation - manual fix needed
 
 -- =============================================================================
 -- TRANSFORMATION 1: Add RecordDotPreprocessor Pragma
@@ -157,7 +263,30 @@ transformImportDecl modAst imp = do
     imp2 <- transformNauRuntimeImport imp1
     imp3 <- transformDBTypesImport imp2
     imp4 <- transformDateParserImport modAst imp3
-    return imp4
+    imp5 <- disambiguateBase64Import imp4
+    return imp5
+
+-- | Disambiguate Data.ByteString.Base64 by changing package from base64 to base64-bytestring
+-- Both base64-1.0 and base64-bytestring-1.2.1.0 export this module
+-- We want base64-bytestring as it's the traditional API
+disambiguateBase64Import :: Ann UImportDecl (Dom GhcPs) SrcTemplateStage -> IO (Ann UImportDecl (Dom GhcPs) SrcTemplateStage)
+disambiguateBase64Import imp@(Ann ann (UImportDecl src qual safe pkg name rename spec)) = do
+    case name of
+      Ann _ (UModuleName mn) | mn == "Data.ByteString.Base64" ->
+          -- Change package name to base64-bytestring if it's base64 or missing
+          case pkg of
+            AnnMaybeG pkgAnn (Just (Ann strAnn (UStringNode pkgStr))) ->
+                if pkgStr == "base64" || pkgStr == "\"base64\""
+                  then do
+                    let newPkg = AnnMaybeG pkgAnn (Just (Ann strAnn (UStringNode "base64-bytestring")))
+                    return $ Ann ann (UImportDecl src qual safe newPkg name rename spec)
+                  else return imp
+            AnnMaybeG pkgAnn Nothing -> do
+                -- Add package name base64-bytestring
+                let newPkg = AnnMaybeG pkgAnn (Just (mkAnn' "base64-bytestring" (UStringNode "base64-bytestring")))
+                return $ Ann ann (UImportDecl src qual safe newPkg name rename spec)
+      _ -> return imp
+disambiguateBase64Import imp = return imp
 
 -- | cryptonite -> crypton
 transformCryptonImport :: Ann UImportDecl (Dom GhcPs) SrcTemplateStage -> IO (Ann UImportDecl (Dom GhcPs) SrcTemplateStage)
