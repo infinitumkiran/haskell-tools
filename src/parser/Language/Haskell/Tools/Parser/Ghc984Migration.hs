@@ -294,32 +294,73 @@ mkSimpleIESpec n = mkAnn' child (UIESpec noth'
 -- TRANSFORMATION 3: MTl-2.3 Import Adjustments
 -- =============================================================================
 
+-- | Functions re-exported by mtl-2.2 but not mtl-2.3, which should come from Control.Monad instead
+-- Note: Operators like <$!>, <=<, >=> are NOT exported by Control.Monad either!
+-- They're from Control.Monad and should be imported from there if needed.
+mtlReexportedFunctions :: [String]
+mtlReexportedFunctions =
+    [ "guard", "join", "Monad(..)", "Functor(..)", "MonadFix(..)", "MonadFail(..)"
+    , "sequence", "mapM", "MonadPlus(..)", "mapM_", "sequence_", "(=<<)"
+    , "liftM", "ap", "liftM2", "liftM3", "liftM4", "liftM5"
+    , "when", "filterM", "foldM", "foldM_"
+    , "forever", "mapAndUnzipM", "mfilter", "replicateM", "replicateM_"
+    , "unless", "zipWithM", "zipWithM_", "fix", "void", "forM", "forM_", "msum"
+    -- Note: <$!>, <=<, >=> are NOT in Control.Monad - they were never standard exports
+    ]
+
 -- | Fix specific mtl-2.3 issues for PS.Control.Monad.* modules
 -- These modules need Control.Monad re-exported functions that mtl-2.3 removed.
--- NOTE: This adds Control.Monad import but does NOT add value declarations
--- like 'except = throwError' - those need manual handling.
 transformMtlModule :: Ann UModule (Dom GhcPs) SrcTemplateStage -> IO (Ann UModule (Dom GhcPs) SrcTemplateStage)
 transformMtlModule modAst@(Ann ann (UModule filePragmas head imports decls))
-    | isTargetModule head "PS.Control.Monad.Reader" = addControlMonadImport imports decls
-    | isTargetModule head "PS.Control.Monad.State" = addControlMonadImport imports decls
-    | isTargetModule head "PS.Control.Monad.Except" = addControlMonadImport imports decls
+    | isTargetModule head "PS.Control.Monad.Reader" = fixMtlImports imports decls
+    | isTargetModule head "PS.Control.Monad.State" = fixMtlImports imports decls
+    | isTargetModule head "PS.Control.Monad.Except" = fixMtlImports imports decls
     -- Also fix the .Trans modules that re-export from the base modules
-    | isTargetModule head "PS.Control.Monad.Reader.Trans" = addControlMonadImport imports decls
-    | isTargetModule head "PS.Control.Monad.State.Trans" = addControlMonadImport imports decls
-    | isTargetModule head "PS.Control.Monad.Except.Trans" = addControlMonadImport imports decls
+    | isTargetModule head "PS.Control.Monad.Reader.Trans" = fixMtlImports imports decls
+    | isTargetModule head "PS.Control.Monad.State.Trans" = fixMtlImports imports decls
+    | isTargetModule head "PS.Control.Monad.Except.Trans" = fixMtlImports imports decls
     | otherwise = return modAst
   where
-    addControlMonadImport impList declList = do
+    fixMtlImports impList declList = do
+        -- Step 1: Add Control.Monad import if not present
         let hasControlMonad = any (isImportOf "Control.Monad") (getImportsList impList)
-        if hasControlMonad
-          then return modAst
-          else do
-            let newImport = mkImportFull "Control.Monad"
-            let newImports = case impList of
-                  AnnListG annImp imps -> AnnListG annImp (newImport : imps)
-            return $ Ann ann (UModule filePragmas head newImports declList)
+        let impList1 = if hasControlMonad
+                        then impList
+                        else case impList of
+                              AnnListG annImp imps -> AnnListG annImp (mkImportFull "Control.Monad" : imps)
+        -- Step 2: Remove re-exported functions from mtl imports
+        impList2 <- (!~) (biplateRef @_ @(Ann UImportDecl (Dom GhcPs) SrcTemplateStage)) (return . stripMtlReexports) impList1
+        return $ Ann ann (UModule filePragmas head impList2 declList)
     getImportsList (AnnListG _ imps) = imps
     isImportOf mn (Ann _ (UImportDecl _ _ _ _ (Ann _ (UModuleName n)) _ _)) = n == mn
+
+-- | Strip re-exported Control.Monad functions from mtl imports (for mtl-2.3 compatibility)
+stripMtlReexports :: Ann UImportDecl (Dom GhcPs) SrcTemplateStage -> Ann UImportDecl (Dom GhcPs) SrcTemplateStage
+stripMtlReexports imp@(Ann ann (UImportDecl src qual safe pkg name rename spec)) =
+    case name of
+      Ann _ (UModuleName mn) | mn `elem` mtlModules ->
+          let newSpec = removeReexportedFunctions spec
+          in Ann ann (UImportDecl src qual safe pkg name rename newSpec)
+      _ -> imp
+  where
+    mtlModules = ["Control.Monad.Reader", "Control.Monad.State", "Control.Monad.State.Strict",
+                  "Control.Monad.Except", "Control.Monad.Writer", "Control.Monad.RWS"]
+
+-- | Remove re-exported functions from import spec
+removeReexportedFunctions :: AnnMaybeG UImportSpec (Dom GhcPs) SrcTemplateStage -> AnnMaybeG UImportSpec (Dom GhcPs) SrcTemplateStage
+removeReexportedFunctions spec@(AnnMaybeG ann Nothing) = spec
+removeReexportedFunctions (AnnMaybeG ann (Just (Ann b (UImportSpecList (AnnListG c specs))))) =
+    let filtered = filter (not . isReexportedFunction) specs
+    in if null filtered
+        then AnnMaybeG ann Nothing  -- Remove explicit import list entirely
+        else AnnMaybeG ann (Just (Ann b (UImportSpecList (AnnListG c filtered))))
+removeReexportedFunctions spec = spec
+
+-- | Check if an import spec is a re-exported Control.Monad function
+isReexportedFunction :: Ann UIESpec (Dom GhcPs) SrcTemplateStage -> Bool
+isReexportedFunction (Ann _ (UIESpec _ name _)) =
+    getNameString name `elem` mtlReexportedFunctions
+isReexportedFunction _ = False
 
 isTargetModule :: AnnMaybeG UModuleHead (Dom GhcPs) SrcTemplateStage -> String -> Bool
 isTargetModule (AnnMaybeG _ (Just (Ann _ (UModuleHead (Ann _ (UModuleName mn)) _ _)))) target = mn == target
