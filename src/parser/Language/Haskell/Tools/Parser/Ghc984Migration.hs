@@ -56,8 +56,11 @@ migrateModule modulePath moduleName = do
     let output = prettyPrint transformed
     -- Post-process: fix base64 package imports and base16 expressions
     let fixedOutput1 = fixBase64Imports output
-    let fixedOutput2 = fixBase16Expressions fixedOutput1
-    writeFile outputPath fixedOutput2
+    let fixedOutput2 = fixCryptonImports fixedOutput1
+    let fixedOutput3 = fixBase16Expressions fixedOutput2
+    -- Post-process: fix PS.Data.Foreign.Generic.LR module (NoOverloadedRecordDot)
+    let fixedOutput4 = fixGenericLRModule fixedOutput3 moduleName
+    writeFile outputPath fixedOutput4
     putStrLn $ "Written: " ++ outputPath
     -- Post-processing for specific modules
     appendExceptFunction modulePath moduleName
@@ -81,18 +84,111 @@ fixBase64Imports = unlines . map fixLine . lines
       | w == "base64-bytestring" = "\"base64-bytestring\""
       | otherwise = w
 
+-- | Fix crypton package imports - change cryptonite to crypton
+-- The AST transformation strips the package, so we do text replacement
+fixCryptonImports :: String -> String
+fixCryptonImports = unlines . map fixLine . lines
+  where
+    fixLine line
+      -- Match import statements from Crypto.Cipher.AES that have no package
+      | "import " `isPrefixOf` line
+      , "Crypto.Cipher.AES" `isInfixOf` line
+      , not ("\"crypton" `isInfixOf` line) =
+          -- Add crypton package qualification
+          let parts = words line
+          in unwords (insertCryptonPkg parts)
+      | "import " `isPrefixOf` line
+      , "\"cryptonite\"" `isInfixOf` line =
+          -- Replace cryptonite with crypton
+          replaceAll "\"cryptonite\"" "\"crypton\"" line
+      | otherwise = line
+
+    insertCryptonPkg ("import":rest) = "import":"\"crypton\"":rest
+    insertCryptonPkg parts = parts
+
+    replaceAll old new str =
+        case breakOn old str of
+          (before, "") -> before
+          (before, afterRest) ->
+              let after' = drop (length old) afterRest
+              in before ++ new ++ replaceAll old new after'
+    breakOn pat str =
+        case findIndex (isPrefixOf pat) (tails str) of
+          Nothing -> (str, "")
+          Just idx -> (take idx str, drop idx str)
+
 -- | Fix base16-1.0 API changes in expressions
 -- encodeBase16 now returns Base16 Text, need to extract
 -- decodeBase16 now takes Base16 ByteString, need to wrap input
 fixBase16Expressions :: String -> String
 fixBase16Expressions input =
-    -- Fix encodeBase16 expressions: BS16.encodeBase16 <$> x -> BS16.extractBase16 <$> BS16.encodeBase16 <$> x
-    let step1 = replaceAll "BS16.encodeBase16\n          <*>" "BS16.extractBase16 <$> BS16.encodeBase16\n          <*>" input
-        step2 = replaceAll "BS16.encodeBase16\n          <$>" "BS16.extractBase16 <$> BS16.encodeBase16\n          <$>" step1
-        -- Fix decodeBase16: BS16.decodeBase16 (encodeUtf8 hash) -> BS16.decodeBase16 (BS16.Base16 (encodeUtf8 hash))
-        step3 = replaceAll "BS16.decodeBase16 (encodeUtf8" "BS16.decodeBase16 (BS16.Base16 (encodeUtf8" step2
-    in step3
+    -- Fix encodeBase16 expressions: BS16.encodeBase16 <$> x -> extractBase16 <$> BS16.encodeBase16 <$> x
+    let step1 = replaceAll "BS16.encodeBase16\n          <*>" "extractBase16 <$> BS16.encodeBase16\n          <*>" input
+        step2 = replaceAll "BS16.encodeBase16\n          <$>" "extractBase16 <$> BS16.encodeBase16\n          <$>" step1
+        -- Fix decodeBase16: BS16.decodeBase16 (encodeUtf8 hash) -> BS16.decodeBase16 (Base16 (encodeUtf8 hash))
+        step3 = replaceAll "BS16.decodeBase16 (encodeUtf8" "BS16.decodeBase16 (Base16 (encodeUtf8" step2
+        -- Add Data.Base16.Types import if needed
+        step4 = if "extractBase16" `isInfixOf` step3 && not ("Data.Base16.Types" `isInfixOf` step3)
+                  then addBase16TypesImport step3
+                  else step3
+    in step4
   where
+    replaceAll old new str =
+        case breakOn old str of
+          (before, "") -> before
+          (before, afterRest) ->
+              let after' = drop (length old) afterRest
+              in before ++ new ++ replaceAll old new after'
+    breakOn pat str =
+        case findIndex (isPrefixOf pat) (tails str) of
+          Nothing -> (str, "")
+          Just idx -> (take idx str, drop idx str)
+    addBase16TypesImport content =
+        let lines' = lines content
+            importIdx = fromMaybe 0 $ findIndex ("import " `isPrefixOf`) lines'
+            newImport = "import Data.Base16.Types (Base16(Base16), extractBase16)"
+        in unlines (take importIdx lines' ++ [newImport] ++ drop importIdx lines')
+
+-- | Fix PS.Data.Foreign.Generic.LR module for NoOverloadedRecordDot
+-- This module has conflicts between large-records plugin and OverloadedRecordDot
+fixGenericLRModule :: String -> String -> String
+fixGenericLRModule content modName
+    | modName == "PS.Data.Foreign.Generic.LR" =
+        let -- Step 1: Add NoOverloadedRecordDot pragma
+            content1 = addNoOverloadedRecordDot content
+            -- Step 2: Fix Options import to expose field selectors
+            content2 = fixOptionsImportForLR content1
+            -- Step 3: Transform record dot expressions to function applications
+            content3 = fixRecordDotExprs content2
+        in content3
+    | otherwise = content
+  where
+    addNoOverloadedRecordDot c
+        | "NoOverloadedRecordDot" `isInfixOf` c = c
+        | otherwise =
+            let lines' = lines c
+                pragmaIdx = fromMaybe 0 $ findIndex ("{-# LANGUAGE " `isPrefixOf`) lines'
+                newPragma = "{-# LANGUAGE NoOverloadedRecordDot #-}"
+            in unlines (take (pragmaIdx + 1) lines' ++ [newPragma] ++ drop (pragmaIdx + 1) lines')
+
+    fixOptionsImportForLR c =
+        replaceAll "import  PS.Data.Foreign.Generic.Types ( Options )"
+               "import  PS.Data.Foreign.Generic.Types\n    ( Options, SumEncoding, unwrapSingleArguments, unwrapSingleConstructors\n    , omitNothingFields, sumEncoding, fieldTransform, tagFieldName\n    , contentsFieldName, constructorTagTransform )" c
+
+    fixRecordDotExprs c =
+        -- Transform nested accesses first (deepest), then simple ones
+        let -- Handle nested: opts.sumEncoding.tagFieldName -> tagFieldName (sumEncoding opts)
+            step1 = replaceAll "opts.sumEncoding.tagFieldName" "tagFieldName (sumEncoding opts)" c
+            step2 = replaceAll "opts.sumEncoding.contentsFieldName" "contentsFieldName (sumEncoding opts)" step1
+            step3 = replaceAll "opts.sumEncoding.constructorTagTransform" "constructorTagTransform (sumEncoding opts)" step2
+            -- Handle simple: opts.unwrapSingleArguments -> unwrapSingleArguments opts
+            step4 = replaceAll "opts.unwrapSingleArguments" "unwrapSingleArguments opts" step3
+            step5 = replaceAll "opts.unwrapSingleConstructors" "unwrapSingleConstructors opts" step4
+            step6 = replaceAll "opts.omitNothingFields" "omitNothingFields opts" step5
+            step7 = replaceAll "opts.sumEncoding" "sumEncoding opts" step6
+            step8 = replaceAll "opts.fieldTransform" "fieldTransform opts" step7
+        in step8
+
     replaceAll old new str =
         case breakOn old str of
           (before, "") -> before
@@ -175,20 +271,27 @@ addMissingImports modAst@(Ann ann (UModule filePragmas head imports decls)) =
 -- We need to wrap encodeBase16 calls with unBase16
 transformBase16Module :: Ann UModule (Dom GhcPs) SrcTemplateStage -> IO (Ann UModule (Dom GhcPs) SrcTemplateStage)
 transformBase16Module modAst@(Ann ann (UModule filePragmas head imports decls)) = do
-    -- Check if this module imports Data.ByteString.Base16
-    let hasBase16Import = any isBase16Import (getImportsList imports)
-    if not hasBase16Import
-      then return modAst
+    -- Check if this module is PS.Data.Foreign.Generic.LR (needs special handling)
+    let isGenericLR = isModuleNamed "PS.Data.Foreign.Generic.LR" head
+    if isGenericLR
+      then transformGenericLRModule modAst
       else do
-        -- Step 1: Transform imports (remove extractBase16 if present, add unBase16)
-        let imports1 = transformBase16Imports imports
-        -- Step 2: Wrap encodeBase16 calls with unBase16
-        decls2 <- (!~) (biplateRef @_ @(Ann UExpr (Dom GhcPs) SrcTemplateStage)) (return . wrapEncodeBase16) decls
-        return $ Ann ann (UModule filePragmas head imports1 decls2)
+        -- Check if this module imports Data.ByteString.Base16
+        let hasBase16Import = any isBase16Import (getImportsList imports)
+        if not hasBase16Import
+          then return modAst
+          else do
+            -- Step 1: Transform imports (remove extractBase16 if present, add unBase16)
+            let imports1 = transformBase16Imports imports
+            -- Step 2: Wrap encodeBase16 calls with unBase16
+            decls2 <- (!~) (biplateRef @_ @(Ann UExpr (Dom GhcPs) SrcTemplateStage)) (return . wrapEncodeBase16) decls
+            return $ Ann ann (UModule filePragmas head imports1 decls2)
   where
     getImportsList (AnnListG _ imps) = imps
     isBase16Import (Ann _ (UImportDecl _ _ _ _ (Ann _ (UModuleName n)) _ _)) =
         n == "Data.ByteString.Base16" || n == "qualified Data.ByteString.Base16"
+    isModuleNamed target (AnnMaybeG _ (Just (Ann _ (UModuleHead (Ann _ (UModuleName mn)) _ _)))) = mn == target
+    isModuleNamed _ _ = False
 
 -- | Transform base16 imports: remove extractBase16
 -- Note: In base16-1.0, encodeBase16 returns Base16 Text which requires
@@ -223,6 +326,14 @@ isExtractBase16Spec _ = False
 -- The full transformation would wrap encodeBase16 calls with unBase16
 wrapEncodeBase16 :: Ann UExpr (Dom GhcPs) SrcTemplateStage -> Ann UExpr (Dom GhcPs) SrcTemplateStage
 wrapEncodeBase16 expr = expr  -- Identity transformation - manual fix needed
+
+-- | Transform PS.Data.Foreign.Generic.LR to handle NoOverloadedRecordDot
+-- This module has conflicts between large-records plugin and OverloadedRecordDot
+-- We use post-processing text replacement since AST transformation is complex
+transformGenericLRModule :: Ann UModule (Dom GhcPs) SrcTemplateStage -> IO (Ann UModule (Dom GhcPs) SrcTemplateStage)
+transformGenericLRModule modAst@(Ann ann (UModule filePragmas head imports decls)) = do
+    -- Just return the module unchanged - we'll use post-processing text replacement
+    return modAst
 
 -- =============================================================================
 -- TRANSFORMATION 1: Add RecordDotPreprocessor Pragma
@@ -294,7 +405,11 @@ transformCryptonImport imp@(Ann ann (UImportDecl src qual safe pkg name rename s
     case pkg of
       AnnMaybeG pkgAnn (Just (Ann strAnn (UStringNode pkgStr))) ->
           let firstWord = takeWhile (/= ' ') pkgStr
-          in if firstWord == "cryptonite"
+                        -- Strip quotes if present
+              cleanPkg = case firstWord of
+                           ('"':rest) | last rest == '"' -> init rest
+                           _ -> firstWord
+          in if cleanPkg == "cryptonite"
             then do
               let newPkg = AnnMaybeG pkgAnn (Just (Ann strAnn (UStringNode "crypton")))
               return $ Ann ann (UImportDecl src qual safe newPkg name rename spec)
